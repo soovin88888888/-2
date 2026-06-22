@@ -4,126 +4,155 @@ import datetime
 import baostock as bs
 import pandas as pd
 import os
+from urllib.parse import quote
 
 # ================= 配置区 =================
-# 从 GitHub Secrets 读取密钥，更安全
 SCKEY = os.getenv("SERVERCHAN_KEY", "")
-# ===== 自动获取沪深两市所有A股股票 =====
+# ==========================================
+
 def get_all_stocks():
+    """获取全市场股票列表"""
     print("正在从 BaoStock 获取全市场股票列表...")
-    lg = bs.login()
-    # 获取所有A股股票的基本信息
-    rs = bs.query_all_stock(day="2024-01-01") # 这里的日期只要是个最近的交易日即可
+    rs = bs.query_all_stock(day=datetime.datetime.now().strftime('%Y-%m-%d'))
     data_list = []
     while (rs.error_code == '0') & rs.next():
         data_list.append(rs.get_row_data())
-    bs.logout()
     
+    if not data_list:
+        print("获取股票列表失败")
+        return []
+        
     df = pd.DataFrame(data_list, columns=rs.fields)
-    # 筛选出 sh. 和 sz. 开头的正常股票（过滤掉指数、退市股等）
     df = df[df['code'].str.startswith(('sh.6', 'sz.0', 'sz.3'))]
-    # 可选：过滤掉 ST 股票（如果不想要 ST 股，取消下面这行的注释）
-    # df = df[~df['code_name'].str.contains('ST')] 
-    
     stock_list = df['code'].tolist()
     print(f"成功获取 {len(stock_list)} 只股票。")
     return stock_list
 
-# 替换原来的固定列表
-STOCK_LIST = get_all_stocks()
-# ==========================================
+def get_stock_data(code, freq, days):
+    """获取股票数据（移除重复登录登出）"""
+    end_date = datetime.datetime.now().strftime('%Y-%m-%d')
+    start_date = (datetime.datetime.now() - datetime.timedelta(days=days)).strftime('%Y-%m-%d')
+    
+    fields = "date,close,low,high"
+    if freq == "60":
+        fields += ",time"
+        
+    rs = bs.query_history_k_data_plus(
+        code, fields, start_date=start_date, end_date=end_date, 
+        frequency=freq, adjustflag="2"
+    )
+    
+    data_list = []
+    while (rs.error_code == '0') & rs.next():
+        data_list.append(rs.get_row_data())
+    
+    if not data_list:
+        return None
+        
+    return pd.DataFrame(data_list, columns=rs.fields)
 
 def is_60min_second_buy(code):
     try:
-        bs.login()
-        today = datetime.datetime.today().strftime('%Y-%m-%d')
-        
-        # 1. 获取日线数据（判断是否有大跌背景，模拟一买前提）
-        start_date = (datetime.datetime.today() - datetime.timedelta(days=60)).strftime('%Y-%m-%d')
-        rs_d = bs.query_history_k_data_plus(code, "date,close,low", start_date=start_date, end_date=today, frequency="d", adjustflag="2")
-        daily_data = []
-        while (rs_d.error_code == '0') & rs_d.next():
-            daily_data.append(rs_d.get_row_data())
-            
-        if len(daily_data) < 10:
-            bs.logout()
+        daily_df = get_stock_data(code, "d", 60)
+        if daily_df is None or len(daily_df) < 20:
             return False, "日线数据不足"
             
-        # 2. 获取60分钟数据
-        start_60m = (datetime.datetime.today() - datetime.timedelta(days=15)).strftime('%Y-%m-%d')
-        rs_60 = bs.query_history_k_data_plus(code, "date,time,close,low,high", start_date=start_60m, end_date=today, frequency="60", adjustflag="2")
-        min_data = []
-        while (rs_60.error_code == '0') & rs_60.next():
-            min_data.append(rs_60.get_row_data())
+        min60_df = get_stock_data(code, "60", 30)
+        if min60_df is None or len(min60_df) < 10:
+            return False, "60分钟数据不足"
             
-        bs.logout()
+        min60_df['close'] = pd.to_numeric(min60_df['close'], errors='coerce')
+        min60_df['low'] = pd.to_numeric(min60_df['low'], errors='coerce')
+        min60_df['high'] = pd.to_numeric(min60_df['high'], errors='coerce')
+        daily_df['close'] = pd.to_numeric(daily_df['close'], errors='coerce')
         
-        if len(min_data) < 8:
-            return False, "60min数据不足"
+        recent_lows = min60_df['low'].values
+        if len(recent_lows) < 5:
+            return False, "数据不足"
             
-        # --- 核心形态判断逻辑 ---
-        # 找到60分钟最近的最低点
-        lows = [float(row[3]) for row in min_data]
-        recent_low_idx = lows.index(min(lows))
-        recent_low = lows[recent_low_idx]
+        recent_low = min(recent_lows[-5:])
+        recent_low_idx = list(recent_lows[-5:]).index(recent_low)
         
-        # 最低点必须在最近4根K线内（说明刚企稳）
-        if recent_low_idx < len(min_data) - 4:
+        if recent_low_idx == 4:
             return False, "仍在探底中"
             
-        # 找反弹高点
-        if recent_low_idx < 2:
-            return False, "反弹结构不完整"
-        highs_before_low = [float(row[4]) for row in min_data[:recent_low_idx]]
-        rebound_high = max(highs_before_low) if highs_before_low else 0
-        
-        # 找更早的低点（模拟一买低点）
-        if recent_low_idx < 4:
-            return False, "结构周期不够"
-        earlier_lows = [float(row[3]) for row in min_data[:recent_low_idx-2]]
-        first_buy_low = min(earlier_lows) if earlier_lows else 0
-        
-        # 条件A：回调不破前低（二买核心）
-        if recent_low < first_buy_low:
-            return False, "跌破前低(二买失败)"
+        if recent_low_idx > 0:
+            rebound_high = min60_df['high'].values[-5:][recent_low_idx-1]
+            current_high = min60_df['high'].values[-1]
+            if current_high <= rebound_high:
+                return False, "反弹力度不足"
+                
+        daily_closes = daily_df['close'].values[-20:]
+        max_drop = (daily_closes[0] - min(daily_closes)) / daily_closes[0]
+        if max_drop < 0.08:
+            return False, "无一买背景"
             
-        # 条件B：当前价格企稳反弹
-        current_close = float(min_data[-1][2])
-        low_close = float(min_data[recent_low_idx][2])
-        if current_close <= low_close:
-            return False, "尚未企稳反弹"
+        current_close = min60_df['close'].values[-1]
+        if current_close <= recent_low:
+            return False, "尚未企稳"
             
-        # 条件C：日线前期有大幅下跌（有一买背景）
-        daily_closes = [float(row[1]) for row in daily_data]
-        if len(daily_closes) > 20:
-            drop_pct = (daily_closes[-20] - min(daily_closes[-20:])) / daily_closes[-20]
-            if drop_pct < 0.05: # 近20天最大跌幅不足5%
-                return False, "无一买背景"
-
-        return True, f"触发二买形态! 当前价:{current_close}"
+        return True, f"触发二买! 当前价:{current_close:.2f}"
         
     except Exception as e:
-        return False, f"计算出错: {e}"
+        return False, f"计算出错: {str(e)}"
+
+def send_notification(title, content):
+    if not SCKEY:
+        print("未设置SCKEY，跳过推送")
+        return
+        
+    try:
+        encoded_content = quote(content)
+        url = f"https://sctapi.ftqq.com/{SCKEY}.send?title={title}&desp={encoded_content}"
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            print("✅ 推送成功")
+        else:
+            print(f" 推送失败: {response.text}")
+    except Exception as e:
+        print(f" 推送异常: {e}")
 
 def main():
-    print(f"[{datetime.datetime.now()}] 开始扫描...")
+    # 全局只登录一次
+    lg = bs.login()
+    if lg.error_code != '0':
+        print(f"BaoStock登录失败: {lg.error_msg}")
+        return
+    
+    print(f"[{datetime.datetime.now()}] 开始扫描缠论60分钟二买...")
     hit_stocks = []
     
-    for stock in STOCK_LIST:
+    stock_list = get_all_stocks()
+    if not stock_list:
+        print(" 获取股票列表失败")
+        bs.logout()
+        return
+        
+    total = len(stock_list)
+    for i, stock in enumerate(stock_list):
+        print(f" 进度: {i+1}/{total} | 扫描 {stock}...", end='\r')
+        
         is_match, msg = is_60min_second_buy(stock)
-        print(f"扫描 {stock}: {msg}")
         if is_match:
             hit_stocks.append(f"{stock} - {msg}")
-        time.sleep(1)
+        time.sleep(0.3)
         
-    if hit_stocks and SCKEY:
-        title = "🚀 缠论60分钟二买提醒"
+    # 统一登出
+    bs.logout()
+    
+    print("\n" + "="*60)
+    print(f"扫描完成! 共扫描 {total} 只股票，命中 {len(hit_stocks)} 只")
+    print("="*60)
+    
+    if hit_stocks:
+        title = "缠论60分钟二买提醒"
         content = "\n\n".join(hit_stocks)
-        url = f"https://sctapi.ftqq.com/{SCKEY}.send?text={title}&desp={content}"
-        requests.get(url)
-        print("✅ 已推送微信提醒！")
-    elif not hit_stocks:
-        print("今日无符合条件的股票。")
+        print("\n 命中股票列表:")
+        for stock in hit_stocks:
+            print(f"  • {stock}")
+        send_notification(title, content)
+    else:
+        print("📭 今日无符合条件的股票")
 
 if __name__ == '__main__':
     main()
