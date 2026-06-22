@@ -2,13 +2,35 @@ import requests
 import time
 import datetime
 import baostock as bs
+import pandas as pd
 import os
 
 # ================= 配置区 =================
 # 从 GitHub Secrets 读取密钥，更安全
 SCKEY = os.getenv("SERVERCHAN_KEY", "")
-# 想要扫描的股票代码列表（baostock格式：sh.600000）
-STOCK_LIST = ['sh.600000', 'sz.000001', 'sh.600519', 'sz.300750']
+# ===== 自动获取沪深两市所有A股股票 =====
+def get_all_stocks():
+    print("正在从 BaoStock 获取全市场股票列表...")
+    lg = bs.login()
+    # 获取所有A股股票的基本信息
+    rs = bs.query_all_stock(day="2024-01-01") # 这里的日期只要是个最近的交易日即可
+    data_list = []
+    while (rs.error_code == '0') & rs.next():
+        data_list.append(rs.get_row_data())
+    bs.logout()
+    
+    df = pd.DataFrame(data_list, columns=rs.fields)
+    # 筛选出 sh. 和 sz. 开头的正常股票（过滤掉指数、退市股等）
+    df = df[df['code'].str.startswith(('sh.6', 'sz.0', 'sz.3'))]
+    # 可选：过滤掉 ST 股票（如果不想要 ST 股，取消下面这行的注释）
+    # df = df[~df['code_name'].str.contains('ST')] 
+    
+    stock_list = df['code'].tolist()
+    print(f"成功获取 {len(stock_list)} 只股票。")
+    return stock_list
+
+# 替换原来的固定列表
+STOCK_LIST = get_all_stocks()
 # ==========================================
 
 def is_60min_second_buy(code):
