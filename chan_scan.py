@@ -11,21 +11,29 @@ SCKEY = os.getenv("SERVERCHAN_KEY", "")
 # ==========================================
 
 def get_all_stocks():
-    """获取全市场股票列表"""
+    """获取全市场股票列表，仅保留300、688开头"""
     print("正在从 BaoStock 获取全市场股票列表...")
+    lg = bs.login()
+    if lg.error_code != '0':
+        print(f"登录失败: {lg.error_msg}")
+        return []
+    
     rs = bs.query_all_stock(day=datetime.datetime.now().strftime('%Y-%m-%d'))
     data_list = []
     while (rs.error_code == '0') & rs.next():
         data_list.append(rs.get_row_data())
+    bs.logout()
     
     if not data_list:
         print("获取股票列表失败")
         return []
         
     df = pd.DataFrame(data_list, columns=rs.fields)
-    df = df[df['code'].str.startswith(('sh.6', 'sz.0', 'sz.3'))]
+    # 只保留 sz.300 创业板、sh.688 科创板
+    mask = df['code'].str.startswith(("sz.300", "sh.688"))
+    df = df[mask]
     stock_list = df['code'].tolist()
-    print(f"成功获取 {len(stock_list)} 只股票。")
+    print(f"成功获取300/688标的共 {len(stock_list)} 只。")
     return stock_list
 
 def get_stock_data(code, freq, days):
