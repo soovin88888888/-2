@@ -11,25 +11,24 @@ SCKEY = os.getenv("SERVERCHAN_KEY", "")
 # ==========================================
 
 def get_all_stocks():
-    """获取全市场股票列表，仅保留300、688开头"""
+    """获取全市场股票列表，仅保留300、688开头，移除内部登录登出"""
     print("正在从 BaoStock 获取全市场股票列表...")
-    lg = bs.login()
-    if lg.error_code != '0':
-        print(f"登录失败: {lg.error_msg}")
+    day_str = datetime.datetime.now().strftime('%Y-%m-%d')
+    rs = bs.query_all_stock(day=day_str)
+    data_list = []
+    try:
+        while (rs.error_code == '0') & rs.next():
+            data_list.append(rs.get_row_data())
+    except Exception as e:
+        print(f"拉取股票列表网络异常：{e}")
         return []
     
-    rs = bs.query_all_stock(day=datetime.datetime.now().strftime('%Y-%m-%d'))
-    data_list = []
-    while (rs.error_code == '0') & rs.next():
-        data_list.append(rs.get_row_data())
-    bs.logout()
-    
     if not data_list:
-        print("获取股票列表失败")
+        print("接口返回空数据，获取股票列表失败")
         return []
         
     df = pd.DataFrame(data_list, columns=rs.fields)
-    # 只保留 sz.300 创业板、sh.688 科创板
+    # 只保留创业板sz.300、科创板sh.688
     mask = df['code'].str.startswith(("sz.300", "sh.688"))
     df = df[mask]
     stock_list = df['code'].tolist()
@@ -37,7 +36,7 @@ def get_all_stocks():
     return stock_list
 
 def get_stock_data(code, freq, days):
-    """获取股票数据（移除重复登录登出）"""
+    """获取股票K线，无登录登出"""
     end_date = datetime.datetime.now().strftime('%Y-%m-%d')
     start_date = (datetime.datetime.now() - datetime.timedelta(days=days)).strftime('%Y-%m-%d')
     
@@ -51,8 +50,11 @@ def get_stock_data(code, freq, days):
     )
     
     data_list = []
-    while (rs.error_code == '0') & rs.next():
-        data_list.append(rs.get_row_data())
+    try:
+        while (rs.error_code == '0') & rs.next():
+            data_list.append(rs.get_row_data())
+    except Exception:
+        return None
     
     if not data_list:
         return None
@@ -116,51 +118,52 @@ def send_notification(title, content):
         if response.status_code == 200:
             print("✅ 推送成功")
         else:
-            print(f" 推送失败: {response.text}")
+            print(f"推送失败: {response.text}")
     except Exception as e:
-        print(f" 推送异常: {e}")
+        print(f"推送异常: {e}")
 
 def main():
-    # 全局只登录一次
+    # 全局仅登录一次
     lg = bs.login()
     if lg.error_code != '0':
         print(f"BaoStock登录失败: {lg.error_msg}")
         return
+    print("login success!")
     
     print(f"[{datetime.datetime.now()}] 开始扫描缠论60分钟二买...")
     hit_stocks = []
     
     stock_list = get_all_stocks()
     if not stock_list:
-        print(" 获取股票列表失败")
+        print("获取股票列表失败，程序退出")
         bs.logout()
         return
         
     total = len(stock_list)
     for i, stock in enumerate(stock_list):
         print(f" 进度: {i+1}/{total} | 扫描 {stock}...", end='\r')
-        
         is_match, msg = is_60min_second_buy(stock)
         if is_match:
             hit_stocks.append(f"{stock} - {msg}")
-        time.sleep(0.3)
-        
-    # 统一登出
+        time.sleep(0.2)
+    
+    # 程序结束统一登出
     bs.logout()
+    print("logout success!")
     
     print("\n" + "="*60)
-    print(f"扫描完成! 共扫描 {total} 只股票，命中 {len(hit_stocks)} 只")
+    print(f"扫描完成! 共扫描 {total} 只，命中 {len(hit_stocks)} 只")
     print("="*60)
     
     if hit_stocks:
-        title = "缠论60分钟二买提醒"
+        title = "300/688 缠论60分钟二买提醒"
         content = "\n\n".join(hit_stocks)
-        print("\n 命中股票列表:")
+        print("\n命中股票列表:")
         for stock in hit_stocks:
-            print(f"  • {stock}")
+            print(f" • {stock}")
         send_notification(title, content)
     else:
-        print("📭 今日无符合条件的股票")
+        print("📭 无符合条件股票")
 
 if __name__ == '__main__':
     main()
